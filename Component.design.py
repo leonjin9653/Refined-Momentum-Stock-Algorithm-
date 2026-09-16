@@ -187,6 +187,7 @@ class RegimeDetector:
 
 class MomentumEntryIndicators:
     def __init__(self, raw_data):
+        self.raw_data = raw_data
         self.close = pd.Series(raw_data["Close"])
         self.high = pd.Series(raw_data["High"])
         self.low = pd.Series(raw_data["Low"])
@@ -220,7 +221,120 @@ class MomentumEntryIndicators:
         return pd.Series(avg_true_range)
 
     def donchian_high(self, period = 20):
+        dates = self.close.index 
+        donchian_high = {}
+
+        for i in range(0, period):
+            donchian_high[dates[i]] = None
+        for i in range(period, len(dates)):
+            high_sum = []
+            for g in range(i - period, i):
+                high_sum.append(self.high.values[g])
+
+            donchian_high[dates[i]] = max(high_sum)
+
+        return pd.Series(donchian_high)
+
+    def donchian_low(self, period = 20):
+        dates = self.close.index
+
+        donchian_low = {}
+
+        for i in range(0, period):
+            donchian_low[dates[i]] = None
+        for i in range(period, len(dates)):
+            low_sum = []
+            for g in range(i - period, i):
+                low_sum.append(self.low.values[g])
+
+            donchian_low[dates[i]] = min(low_sum)
+
+        return pd.Series(donchian_low)
+
+    def ema(self, price_data, period):
+        ema = {}
+        start = price_data.first_valid_index()
+        dates = price_data.index
+        prices = price_data.values
+
+        start_start = dates.get_loc(start)
+
+        smoothing_constant = 2/ (period + 1)
+
+        for i in range(0, start_start + period -1):
+            ema[dates[i]] = None
+
+        seed = sum(prices[start_start : start_start + period])/ period
+        ema[dates[start_start + period -1]] = float(seed)
+
+        for i in range(start_start + period, len(prices)):
+            part1 = prices[i] * smoothing_constant
+            part2 = ema[dates[i-1]] * (1 - smoothing_constant)
+            ema[dates[i]] = float(round(part1 + part2, 2)) 
+
+        return pd.Series(ema)
+
+
+    def macd_histogram(self):
+        dates = self.close.index
+        macd_histogram = {}
+        macd = {}
+        signal_line = {}
+
+        fast_ema = self.ema(self.close, 12)
+        slow_ema = self.ema(self.close, 26)
+
+        for i in range(len(dates)):
+            if fast_ema[dates[i]] is None or slow_ema[dates[i]] is None:
+                macd[dates[i]] = None
+            else:
+                macd[dates[i]] = fast_ema[dates[i]] - slow_ema[dates[i]]
+
+        macd = pd.Series(macd)
+        signal_line = self.ema(macd, 9)
+        for i in range(len(dates)):
+            if macd[dates[i]] is None or signal_line[dates[i]] is None:
+                macd_histogram[dates[i]] = None
+            else:
+                macd_histogram[dates[i]] = macd[dates[i]] - signal_line[dates[i]]
+
+        return pd.Series(macd_histogram)
+
+    def rate_of_change(self, period = 10):
+        dates = self.close.index
+        prices = self.close.values 
+        roc = {}
+
+        for i in range(len(dates)):
+            if i - period < 0:
+                roc[dates[i]] = None
+            elif prices[[i - period]] == 0: #extremely unlikely but why not hehe
+                roc[dates[i]] = None
+            else: 
+                roc[dates[i]] = (prices[i] - prices[i - period]) / (prices[i - period] * 100)
+
+        return pd.Series(roc)
+
+    def adx_slope(self, adx, lookback = 5):
+        dates = self.close.index
+
+        adx_slope = {}
+
+        for i in range(len(dates)):
+            if i - lookback < 0:
+                adx_slope[dates[i]] = None
+            elif adx[dates[i]] is None or adx[dates[i - lookback]] is None:
+                adx_slope[dates[i]] = None
+            else:
+                adx_slope[dates[i]] = adx[dates[i]] - adx[dates[i - lookback]]
+
+        return pd.Series(adx_slope)
+
+class MomentumSignals:
         
+        
+
+
         
 
 

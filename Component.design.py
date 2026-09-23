@@ -1,352 +1,328 @@
-import pandas as pd
+from collections import deque
+
 import numpy as np
+import pandas as pd
 import yfinance as yf
 
 class DataHandler:
     def __init__(self, ticker, start, end):
-        raw_data = yf.download(ticker, start, end, interval="1d")
+        raw_data = yf.download(ticker, start, end, interval="1d", auto_adjust=True)
 
-        if isinstance(raw_data.columns, pd.MultiIndex):
-            raw_data.columns = raw_data.columns.get_level_values(0)
         if raw_data.empty:
             raise ValueError (f"No data returned for {ticker}.")
+        if isinstance(raw_data.columns, pd.MultiIndex):
+            raw_data.columns = raw_data.columns.get_level_values(0)
 
-        self.close = raw_data["Close"]
-        self.high = raw_data["High"]
-        self.low = raw_data["Low"]
-        self.volume = raw_data["Volume"]
-        self.open = raw_data["Open"]
+        self._data = raw_data[["Open", "High", "Low", "Close", "Volume"]]
+        self._dates = raw_data.index
+        self._open = raw_data["Open"].to_numpy()
+        self._high = raw_data["High"].to_numpy()
+        self._low = raw_data["Low"].to_numpy()
+        self._close = raw_data["Close"].to_numpy()
+        self._volume = raw_data["Volume"].to_numpy()
 
-        self.current_index = 0
-        self.current_date = self.close.index[0]
-        self.final_date = self.close.index[-1]
+        self.current_index = -1
+
+    def current_date(self):
+        if self.current_index < 0:
+            return None
+        return self._dates[self.current_index]
 
     def advance(self):
-        if self.current_date != self.final_date:
+        if self.current_index + 1 < len(self._dates):
             self.current_index += 1
-            self.current_date = self.close.index[self.current_index]
             return True
         return False
-    def get_current_price(self):
-        return self.close.loc[self.current_date], self.high.loc[self.current_date], self.low.loc[self.current_date], self.volume.loc[self.current_date], self.open.loc[self.current_date]
+
+    def get_current_bar(self):
+        if self.current_index < 0:
+            raise RuntimeError("No bar released yet, call advance() first.")
+        i = self.current_index
+        return {
+            "date": self._dates[i],
+            "open": float(self._open[i]),
+            "high": float(self._high[i]),
+            "low": float(self._low[i]),
+            "close": float(self._close[i]),
+            "volume": float(self._volume[i]),
+        }
+
     def get_data_up_to_current(self):
-        return self.close.iloc[:self.current_index + 1], self.high.iloc[:self.current_index + 1], self.low.iloc[:self.current_index + 1], self.volume.iloc[:self.current_index + 1], self.open.iloc[:self.current_index + 1]
+        return self._data.iloc[:self.current_index + 1].copy()
+
     def reset(self):
-        self.current_index = 0
-        self.current_date = self.close.index[0]
-        return self.current_date, self.current_index
+        self.current_index = -1
+
+    def stream(self):
+        self.reset()
+        while self.advance():
+            yield self.get_current_bar()
+
+class WilderAverage:
+    def __init__(self, period):
+        self.period = period
+        self._seed_values = []
+        self.value = None
+
+    def update(self, x):
+        if self.value is None:
+            self._seed_values.append(x)
+            if len(self._seed_values) == self.period:
+                self.value = sum(self._seed_values) / self.period
+        else:
+            self.value = self.value + (x - self.value) / self.period
+        return self.value
+
+class EMA:
+    def __init__(self, period):
+        self.period = period
+        self.smoothing_constant = 2 / (period + 1)
+        self._seed_values = []
+        self.value = None
+
+    def update(self, x):
+        if x is None:
+            return self.value
+        if self.value is None:
+            self._seed_values.append(x)
+            if len(self._seed_values) == self.period:
+                self.value = sum(self._seed_values) / self.period
+        else:
+            self.value = x * self.smoothing_constant + self.value * (1 - self.smoothing_constant)
+        return self.value
+
+def true_range(high, low, prev_close):
+    current_trading_range = high - low
+    upward_gap = abs(high - prev_close)
+    downward_gap = abs(low - prev_close)
+    return max(current_trading_range, upward_gap, downward_gap)
 
 class RegimeDetector:
-    def __init__(self, raw_data):
-        self.close = pd.Series(raw_data["Close"])
-        self.high = pd.Series(raw_data["High"])
-        self.low = pd.Series(raw_data["Low"])
+    def __init__(self, period = 14, strength_threshold = 25, vol_window = 20, vol_lookback = 100, pct_threshold = 0.7):
+        self.period = period
+        self.strength_threshold = strength_threshold
+        self.pct_threshold = pct_threshold
 
-    def trend_strength(self, period = 14):
-        adx = {}
-        pos_dm = {}
-        neg_dm = {}
-        dates = self.close.index
-        true_range = {}
-        
-        for i in range(1, len(dates)):
-            current_trading_range = self.high.values[i] - self.low.values[i]
-            upward_gap = abs(self.high.values[i] - self.close.values[i - 1])
-            downward_gap = abs(self.low.values[i] - self.close.values[i - 1])
+        self._prev_close = None
+        self._prev_high = None
+        self._prev_low = None
 
-            true_range[dates[i]] = max(current_trading_range, upward_gap, downward_gap)
+        self._smoothed_TR = WilderAverage(period)
+        self._smoothed_pos_dm = WilderAverage(period)
+        self._smoothed_neg_dm = WilderAverage(period)
+        self._adx = WilderAverage(period)
 
-            up_move = self.high.values[i] - self.high.values[i - 1]
-            down_move = self.low.values[i - 1] - self.low.values[i]
+        self._returns = deque(maxlen=vol_window)
+        self._volatilities = deque(maxlen=vol_lookback)
 
-            if up_move > down_move and up_move > 0:
-                pos_dm[dates[i]] = up_move
-            else:
-                pos_dm[dates[i]] = 0 
-            if down_move >up_move and down_move > 0:
-                neg_dm[dates[i]] = down_move
-            else:
-                neg_dm[dates[i]] = 0
+        self.adx = None
+        self.trend = None
+        self.rolling_volatility = None
+        self.volatility_percentile = None
+        self.volatility_classification = None
+        self.regime = None
 
-        smoothed_TR = {}
-        smoothed_pos_dm = {}
-        smoothed_neg_dm = {}
-        for _ in range(0, period):
-            smoothed_TR[dates[_]] = None
-            smoothed_pos_dm[dates[_]] = None
-            smoothed_neg_dm[dates[_]] = None
+    def update(self, bar):
+        high, low, close = bar["high"], bar["low"], bar["close"]
 
-        total_TR = 0
-        total_pdm = 0 
-        total_ndm = 0
-        for k in range(1, period + 1):
-            total_TR += true_range[dates[k]]
-            total_pdm += pos_dm[dates[k]]
-            total_ndm += neg_dm[dates[k]]
-        smoothed_TR[dates[period]] = total_TR / period
-        smoothed_pos_dm[dates[period]] = total_pdm / period
-        smoothed_neg_dm[dates[period]] = total_ndm / period
-        
-        for j in range(period + 1, len(dates)):
-            smoothed_TR[dates[j]] = smoothed_TR[dates[j-1]] - (smoothed_TR[dates[j - 1]]/period) + true_range[dates[j]]
-            smoothed_pos_dm[dates[j]] = smoothed_pos_dm[dates[j - 1]] - (smoothed_pos_dm[dates[j - 1]]/period) + pos_dm[dates[j]]
-            smoothed_neg_dm[dates[j]] = smoothed_neg_dm[dates[j - 1]] - (smoothed_neg_dm[dates[j - 1]]/period) + neg_dm[dates[j]]
+        if self._prev_close is not None:
+            self._update_trend_strength(high, low)
+            self._update_volatility(close)
 
-        pos_di = {}
-        neg_di = {}
+        self._prev_close = close
+        self._prev_high = high
+        self._prev_low = low
 
-        for _ in range(0, period):
-            pos_di[dates[_]] = None
-            neg_di[dates[_]] = None
-        for l in range(period, len(dates)):
-            pos_di[dates[l]] = 100 * smoothed_pos_dm[dates[l]]/smoothed_TR[dates[l]]
-            neg_di[dates[l]] = 100* smoothed_neg_dm[dates[l]]/smoothed_TR[dates[l]]
+        self.trend = self.classify_trend(self.adx)
+        self.volatility_classification = self.classify_volatility(self.volatility_percentile)
+        self.regime = self.classify_regime(self.trend, self.volatility_classification)
 
-        d_index = {}
-        for _ in range(0, period):
-            d_index[dates[_]] = None
-        for q in range(period, len(dates)):
-            if pos_di[dates[q]] == 0 and neg_di[dates[q]] == 0:
-                d_index[dates[q]] = 0 
-            else:
-                d_index[dates[q]] = 100 * abs(pos_di[dates[q]] - neg_di[dates[q]]) / (pos_di[dates[q]] + neg_di[dates[q]])
+        return {
+            "adx": self.adx,
+            "trend": self.trend,
+            "rolling_volatility": self.rolling_volatility,
+            "volatility_percentile": self.volatility_percentile,
+            "volatility_classification": self.volatility_classification,
+            "regime": self.regime,
+        }
 
-        for _ in range(0, 2 * period):
-            adx[dates[_]] = None
-        total_di = 0 
-        for k in range(period, 2 * period):
-            total_di += d_index[dates[k]]
-        adx[dates[2 * period]] = total_di /period
-        for t in range((2 * period) + 1, len(dates)):
-            adx[dates[t]] = adx[dates[t - 1]] - (adx[dates[t-1]]/period) + d_index[dates[t]]
+    def _update_trend_strength(self, high, low):
+        tr = true_range(high, low, self._prev_close)
 
-        return pd.Series(adx)
+        up_move = high - self._prev_high
+        down_move = self._prev_low - low
 
-    def classify_trend(self, adx, strength_threshold = 25):
-        dates = self.close.index
-        trend = {}
+        if up_move > down_move and up_move > 0:
+            pos_dm = up_move
+        else:
+            pos_dm = 0
+        if down_move > up_move and down_move > 0:
+            neg_dm = down_move
+        else:
+            neg_dm = 0
 
-        adx = adx.astype(object).replace(np.nan, None)
+        smoothed_TR = self._smoothed_TR.update(tr)
+        smoothed_pos_dm = self._smoothed_pos_dm.update(pos_dm)
+        smoothed_neg_dm = self._smoothed_neg_dm.update(neg_dm)
 
-        for i in range(0, len(dates)):
-            if adx[dates[i]] is None:
-                trend[dates[i]] = None
-            elif adx[dates[i]] >= strength_threshold:
-                trend[dates[i]] = "trending"
-            elif adx[dates[i]] < strength_threshold:
-                trend[dates[i]] = "ranging"
+        if smoothed_TR is None:
+            return
+        if smoothed_TR == 0:
+            pos_di = 0
+            neg_di = 0
+        else:
+            pos_di = 100 * smoothed_pos_dm / smoothed_TR
+            neg_di = 100 * smoothed_neg_dm / smoothed_TR
 
-        return pd.Series(trend)
+        if pos_di == 0 and neg_di == 0:
+            d_index = 0
+        else:
+            d_index = 100 * abs(pos_di - neg_di) / (pos_di + neg_di)
 
-    def rolling_volatility(self, window = 20):
-        returns = self.close.pct_change()
-        rolling_volatility = returns.rolling(window=window).std()
+        self.adx = self._adx.update(d_index)
 
-        return rolling_volatility
+    def _update_volatility(self, close):
+        if self._prev_close == 0:
+            return
+        self._returns.append(close / self._prev_close - 1)
 
-    def volatility_percentile(self, rolling_volatility, lookback = 100):
-        volatility_percentiles = rolling_volatility.rolling(lookback).rank(pct=True)
+        if len(self._returns) < self._returns.maxlen:
+            return
+        self.rolling_volatility = float(np.std(self._returns, ddof=1))
+        self._volatilities.append(self.rolling_volatility)
 
-        return volatility_percentiles
+        if len(self._volatilities) < self._volatilities.maxlen:
+            return
+        below = sum(1 for v in self._volatilities if v < self.rolling_volatility)
+        equal = sum(1 for v in self._volatilities if v == self.rolling_volatility)
+        self.volatility_percentile = (below + (equal + 1) / 2) / len(self._volatilities)
 
-    def classify_volatility(self, volatility_percentiles, pct_threshold = 0.7):
-        dates = self.close.index
-        volatility_classification = {}
+    def classify_trend(self, adx):
+        if adx is None:
+            return None
+        elif adx >= self.strength_threshold:
+            return "trending"
+        else:
+            return "ranging"
 
-        volatility_percentiles = volatility_percentiles.astype(object).replace(np.nan, None)
-
-        for i in range(0, len(dates)):
-            if volatility_percentiles[dates[i]] is None:
-                volatility_classification[dates[i]] = None
-            elif volatility_percentiles[dates[i]] >= pct_threshold:
-                volatility_classification[dates[i]] = "high_vol"
-            elif volatility_percentiles[dates[i]] < pct_threshold:
-                volatility_classification[dates[i]] = "low_vol"
-
-        return pd.Series(volatility_classification)
+    def classify_volatility(self, volatility_percentile):
+        if volatility_percentile is None:
+            return None
+        elif volatility_percentile >= self.pct_threshold:
+            return "high_vol"
+        else:
+            return "low_vol"
 
     def classify_regime(self, trend, volatility_classification):
-        dates = self.close.index
-        regime = {}
-
-        for i in range(len(dates)):
-            if trend[dates[i]] is None and volatility_classification[dates[i]] is None:
-                regime[dates[i]] = None
-            elif trend[dates[i]] == "trending" and volatility_classification[dates[i]] == "high_vol":
-                regime[dates[i]] = "trending_high_vol"
-            elif trend[dates[i]] == "trending" and volatility_classification[dates[i]] == "low_vol":
-                regime[dates[i]] = "trending_low_vol"
-            elif trend[dates[i]] == "ranging" and volatility_classification[dates[i]] == "high_vol":
-                regime[dates[i]] = "ranging_high_vol"
-            elif trend[dates[i]] == "ranging" and volatility_classification[dates[i]] == "low_vol":
-                regime[dates[i]] = "ranging_low_vol"
-            else:
-                regime[dates[i]] = None
-
-        return pd.Series(regime)
+        if trend is None or volatility_classification is None:
+            return None
+        return f"{trend}_{volatility_classification}"
 
 class MomentumEntryIndicators:
-    def __init__(self, raw_data):
-        self.raw_data = raw_data
-        self.close = pd.Series(raw_data["Close"])
-        self.high = pd.Series(raw_data["High"])
-        self.low = pd.Series(raw_data["Low"])
+    def __init__(self, atr_period = 14, donchian_period = 20, roc_period = 10, adx_slope_lookback = 5):
+        self._prev_close = None
 
-    def atr(self, period=14):
-        dates = self.close.index
-        true_range = {}
-        
-        for i in range(1, len(dates)):
-            current_trading_range = self.high.values[i] - self.low.values[i]
-            upward_gap = abs(self.high.values[i] - self.close.values[i - 1])
-            downward_gap = abs(self.low.values[i] - self.close.values[i - 1])
+        self._atr = WilderAverage(atr_period)
 
-            true_range[dates[i]] = max(current_trading_range, upward_gap, downward_gap)
+        self._donchian_highs = deque(maxlen=donchian_period)
+        self._donchian_lows = deque(maxlen=donchian_period)
 
-        avg_true_range = {}
+        self._fast_ema = EMA(12)
+        self._slow_ema = EMA(26)
+        self._signal_line = EMA(9)
 
-        for _ in range(0, period):
-            avg_true_range[dates[_]] = None
+        self._roc_closes = deque(maxlen=roc_period + 1)
 
-        total_TR = 0
-        for k in range(1, period + 1):
-            total_TR += true_range[dates[k]]
+        self._adx_history = deque(maxlen=adx_slope_lookback + 1)
 
-        avg_true_range[dates[period]] = total_TR / period
+        self.atr = None
+        self.donchian_high = None
+        self.donchian_low = None
+        self.macd = None
+        self.signal_line = None
+        self.macd_histogram = None
+        self.rate_of_change = None
+        self.adx_slope = None
 
-        for j in range(period + 1, len(dates)):
-            avg_true_range[dates[j]] = avg_true_range[dates[j-1]] - (avg_true_range[dates[j - 1]]/period) + true_range[dates[j]]
+    def update(self, bar, adx):
+        high, low, close = bar["high"], bar["low"], bar["close"]
 
+        self._update_atr(high, low)
+        self._update_donchian(high, low)
+        self._update_macd(close)
+        self._update_rate_of_change(close)
+        self._update_adx_slope(adx)
 
-        return pd.Series(avg_true_range)
+        self._prev_close = close
 
-    def donchian_high(self, period = 20):
-        dates = self.close.index 
-        donchian_high = {}
+        return {
+            "atr": self.atr,
+            "donchian_high": self.donchian_high,
+            "donchian_low": self.donchian_low,
+            "macd": self.macd,
+            "signal_line": self.signal_line,
+            "macd_histogram": self.macd_histogram,
+            "rate_of_change": self.rate_of_change,
+            "adx_slope": self.adx_slope,
+        }
 
-        for i in range(0, period):
-            donchian_high[dates[i]] = None
-        for i in range(period, len(dates)):
-            high_sum = []
-            for g in range(i - period, i):
-                high_sum.append(self.high.values[g])
+    def _update_atr(self, high, low):
+        if self._prev_close is None:
+            return
+        self.atr = self._atr.update(true_range(high, low, self._prev_close))
 
-            donchian_high[dates[i]] = max(high_sum)
+    def _update_donchian(self, high, low):
+        if len(self._donchian_highs) == self._donchian_highs.maxlen:
+            self.donchian_high = max(self._donchian_highs)
+            self.donchian_low = min(self._donchian_lows)
+        self._donchian_highs.append(high)
+        self._donchian_lows.append(low)
 
-        return pd.Series(donchian_high)
+    def _update_macd(self, close):
+        fast = self._fast_ema.update(close)
+        slow = self._slow_ema.update(close)
 
-    def donchian_low(self, period = 20):
-        dates = self.close.index
+        if fast is None or slow is None:
+            return
+        self.macd = fast - slow
+        self.signal_line = self._signal_line.update(self.macd)
 
-        donchian_low = {}
+        if self.signal_line is not None:
+            self.macd_histogram = self.macd - self.signal_line
 
-        for i in range(0, period):
-            donchian_low[dates[i]] = None
-        for i in range(period, len(dates)):
-            low_sum = []
-            for g in range(i - period, i):
-                low_sum.append(self.low.values[g])
+    def _update_rate_of_change(self, close):
+        self._roc_closes.append(close)
 
-            donchian_low[dates[i]] = min(low_sum)
+        if len(self._roc_closes) < self._roc_closes.maxlen:
+            return
+        old_close = self._roc_closes[0]
+        if old_close == 0: #extremely unlikely but why not hehe
+            self.rate_of_change = None
+        else:
+            self.rate_of_change = (close - old_close) / old_close * 100
 
-        return pd.Series(donchian_low)
+    def _update_adx_slope(self, adx):
+        self._adx_history.append(adx)
 
-    def ema(self, price_data, period):
-        ema = {}
-        start = price_data.first_valid_index()
-        dates = price_data.index
-        prices = price_data.values
-
-        start_start = dates.get_loc(start)
-
-        smoothing_constant = 2/ (period + 1)
-
-        for i in range(0, start_start + period -1):
-            ema[dates[i]] = None
-
-        seed = sum(prices[start_start : start_start + period])/ period
-        ema[dates[start_start + period -1]] = float(seed)
-
-        for i in range(start_start + period, len(prices)):
-            part1 = prices[i] * smoothing_constant
-            part2 = ema[dates[i-1]] * (1 - smoothing_constant)
-            ema[dates[i]] = float(round(part1 + part2, 2)) 
-
-        return pd.Series(ema)
-
-
-    def macd_histogram(self):
-        dates = self.close.index
-        macd_histogram = {}
-        macd = {}
-        signal_line = {}
-
-        fast_ema = self.ema(self.close, 12)
-        slow_ema = self.ema(self.close, 26)
-
-        for i in range(len(dates)):
-            if fast_ema[dates[i]] is None or slow_ema[dates[i]] is None:
-                macd[dates[i]] = None
-            else:
-                macd[dates[i]] = fast_ema[dates[i]] - slow_ema[dates[i]]
-
-        macd = pd.Series(macd)
-        signal_line = self.ema(macd, 9)
-        for i in range(len(dates)):
-            if macd[dates[i]] is None or signal_line[dates[i]] is None:
-                macd_histogram[dates[i]] = None
-            else:
-                macd_histogram[dates[i]] = macd[dates[i]] - signal_line[dates[i]]
-
-        return pd.Series(macd_histogram)
-
-    def rate_of_change(self, period = 10):
-        dates = self.close.index
-        prices = self.close.values 
-        roc = {}
-
-        for i in range(len(dates)):
-            if i - period < 0:
-                roc[dates[i]] = None
-            elif prices[[i - period]] == 0: #extremely unlikely but why not hehe
-                roc[dates[i]] = None
-            else: 
-                roc[dates[i]] = (prices[i] - prices[i - period]) / (prices[i - period] * 100)
-
-        return pd.Series(roc)
-
-    def adx_slope(self, adx, lookback = 5):
-        dates = self.close.index
-
-        adx_slope = {}
-
-        for i in range(len(dates)):
-            if i - lookback < 0:
-                adx_slope[dates[i]] = None
-            elif adx[dates[i]] is None or adx[dates[i - lookback]] is None:
-                adx_slope[dates[i]] = None
-            else:
-                adx_slope[dates[i]] = adx[dates[i]] - adx[dates[i - lookback]]
-
-        return pd.Series(adx_slope)
+        if len(self._adx_history) < self._adx_history.maxlen:
+            return
+        old_adx = self._adx_history[0]
+        if adx is None or old_adx is None:
+            self.adx_slope = None
+        else:
+            self.adx_slope = adx - old_adx
 
 class MomentumSignals:
-        
-        
-
-
-        
-# amongus 
-
-            
+    pass
 
 #testing
 
-stock = DataHandler("AAPL", "2025-01-01", "2026-01-20")
-regime = RegimeDetector({"Close": stock.close, "High": stock.high, "Low": stock.low})
-rolling_volatility = regime.rolling_volatility()
-volatility_percentiles = regime.volatility_percentile(rolling_volatility)
-print(regime.classify_volatility(volatility_percentiles))
+if __name__ == "__main__":
+    stock = DataHandler("AAPL", "2025-01-01", "2026-01-20")
+    regime = RegimeDetector()
+    indicators = MomentumEntryIndicators()
 
-
- 
+    for bar in stock.stream():
+        regime_values = regime.update(bar)
+        indicator_values = indicators.update(bar, regime_values["adx"])
+        print(bar["date"].date(), regime_values["regime"], indicator_values["macd_histogram"])

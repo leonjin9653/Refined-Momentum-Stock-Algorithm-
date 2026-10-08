@@ -63,9 +63,9 @@ Rather than a fixed share count or fixed dollar amount per trade, position size 
 
 **Definition:**
 ```
-position_size = (target_risk_pct × portfolio_capital) / (ATR_n × price)
+shares = (target_risk_pct × portfolio_capital) / (k × ATR_n)
 ```
-where `ATR_n` is the n-day Average True Range (a volatility measure in price units) and `target_risk_pct` is a fixed fraction of capital the strategy is willing to risk per trade (e.g. 1%).
+where `ATR_n` is the n-day Average True Range (a volatility measure in price units), `k × ATR_n` is the initial stop distance from §5, and `target_risk_pct` is a fixed fraction of capital the strategy is willing to risk per trade (e.g. 1%). Because the denominator is the dollar loss per share if the stop is hit, a stop-out loses roughly `target_risk_pct` of capital (more if price gaps through the stop). Position value is capped at a fixed fraction of capital (100% by default, i.e. no leverage) so that a quiet stock with a tiny ATR can't produce an oversized position.
 
 **Why this matters:** this is the actual technique used by real time-series momentum strategies (this framework closely mirrors the methodology in Moskowitz, Ooi & Pedersen's *"Time Series Momentum"*, 2012) — sizing by volatility rather than notional keeps a calm, steadily-trending asset and a wildly volatile one contributing comparable risk to the portfolio, instead of the volatile one dominating losses.
 
@@ -90,7 +90,9 @@ The same signal and exit logic runs in both trending regimes, but with different
 | Parameter | `trending_low_vol` | `trending_high_vol` |
 |---|---|---|
 | ATR stop multiplier (k) | Tighter (e.g. 2×) | Wider (e.g. 3.5×) |
-| Position size | Larger (steadier trend, more confidence) | Smaller (turbulent conditions, wider stops eat more risk budget per unit size) |
+| Resulting position size | Larger | Smaller |
+
+Position size is not a separate dial: because §4 sizes by `k × ATR_n`, a tighter `k` in `trending_low_vol` already produces a larger position and a wider `k` in `trending_high_vol` a smaller one, at the same risk per trade. Adding an extra size multiplier on top would double-count the regime. `k` is fixed at entry from the regime at that time and does not change if the regime flips mid-trade.
 
 This isn't two strategies — it's one strategy with regime-aware dials, which is the practical distinction to be clear about in interviews: the *logic* doesn't change, only the *risk parameters*.
 

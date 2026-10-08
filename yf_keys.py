@@ -1,6 +1,6 @@
 import yfinance as yf
-
-ticker = yf.Ticker("AAPL")
+import pandas as pd
+ticker = yf.Ticker("AGI.to")
 
 print(ticker.info.keys())
 

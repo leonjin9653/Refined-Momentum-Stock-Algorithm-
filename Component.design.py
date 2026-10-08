@@ -1,6 +1,9 @@
 import itertools
 import os
+import sys
+import time
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
@@ -552,15 +555,19 @@ class MomentumCrashFilter:
 
 class ATRTrailingStop:
     #k is locked in at entry from the regime at that time, so the stop doesn't jump if the regime flips mid-trade
-    def __init__(self, k_low_vol = 2.0, k_high_vol = 3.5):
+    #regime_based = False uses one k (the midpoint) everywhere, to test whether the regime adds anything to the stop
+    def __init__(self, k_low_vol = 2.0, k_high_vol = 3.5, regime_based = True):
         self.k_low_vol = k_low_vol
         self.k_high_vol = k_high_vol
+        self.regime_based = regime_based
 
         self.k = None
         self.highest_close = None
         self.level = None
 
     def k_for_regime(self, regime):
+        if not self.regime_based:
+            return (self.k_low_vol + self.k_high_vol) / 2
         if regime is not None and regime.endswith("high_vol"):
             return self.k_high_vol
         return self.k_low_vol
@@ -820,14 +827,16 @@ DEFAULT_PARAMS = {
     "k_high_vol": 3.5,
     "risk_pct": 0.01,
     "max_position_pct": 1.0,
-    "use_weekly_filter": True,
+    "use_weekly_filter": False, #tested and rejected: lowered out-of-sample sharpe on 15 of 18 tickers
     "weekly_adx_threshold": 25,
     "use_crash_filter": True,
     "crash_min_low_vol_streak": 20,
     "crash_jump_threshold": 0.30,
     "crash_window": 5,
     "crash_cooldown_days": 10,
-    "use_regime_filter": True,
+    "adx_threshold": 25,
+    "use_regime_filter": False, #tested and rejected as an entry gate: entering in any regime beat it on 13 of 18 tickers
+    "regime_stop_width": True, #the regime's remaining job: tighter stop in low vol, wider in high vol
     "use_ensemble": True,
     "use_trailing_stop": True,
 }
@@ -836,7 +845,7 @@ def run_backtest(data, params = None, trade_start = None):
     #fresh components every run, so the same DataHandler can be backtested many times
     params = {**DEFAULT_PARAMS, **(params or {})}
 
-    regime = RegimeDetector()
+    regime = RegimeDetector(strength_threshold = params["adx_threshold"])
     indicators = MomentumEntryIndicators(donchian_period = params["donchian_period"],
                                          roc_period = params["roc_period"])
     signals = MomentumSignals(regime, indicators,
@@ -846,7 +855,7 @@ def run_backtest(data, params = None, trade_start = None):
                               use_regime_filter = params["use_regime_filter"],
                               use_ensemble = params["use_ensemble"])
     portfolio = Portfolio(params["starting_cash"], params["cost_bps"])
-    stop = ATRTrailingStop(params["k_low_vol"], params["k_high_vol"])
+    stop = ATRTrailingStop(params["k_low_vol"], params["k_high_vol"], regime_based = params["regime_stop_width"])
 
     weekly_filter = None
     if params["use_weekly_filter"]:
@@ -970,7 +979,7 @@ def format_report(report):
     return report.apply(lambda column: [fmt(metric, value) for metric, value in column.items()])
 
 #each axis is a list of values for one param, or a list of dicts for params that move together (the two stop multipliers)
-#kept small on purpose: 3 x 3 x 2 x 3 x 2 = 108 backtests per window
+#kept small on purpose: 3 x 3 x 2 x 3 = 54 backtests per window
 #risk_pct is left out: sharpe barely changes with position size, so picking it by sharpe would be meaningless
 PARAM_GRID = {
     "vote_threshold": [2, 3, 4],
@@ -979,7 +988,6 @@ PARAM_GRID = {
     "stop_k": [{"k_low_vol": 1.5, "k_high_vol": 2.5},
                {"k_low_vol": 2.0, "k_high_vol": 3.5},
                {"k_low_vol": 3.0, "k_high_vol": 5.0}],
-    "use_weekly_filter": [False, True],
 }
 
 def expand_grid(param_grid):
@@ -1113,14 +1121,16 @@ def in_sample_optimized(data, start, end, param_grid = PARAM_GRID, warmup_bars =
 
     return run_backtest(data.slice(start, end, warmup_bars), params, trade_start = start)
 
-#each variant switches exactly one component off relative to the full strategy
+#each variant switches exactly one component off relative to the full strategy, except the rejected
+#components (regime entry gate, weekly filter), which are switched back on so the evidence for dropping them stays reproducible
 ABLATIONS = {
     "Full strategy": {},
-    "No regime filter": {"use_regime_filter": False},
+    "Fixed stop width (no regime)": {"regime_stop_width": False},
     "No ensemble (Donchian only)": {"use_ensemble": False},
-    "No weekly filter": {"use_weekly_filter": False},
     "No crash filter": {"use_crash_filter": False},
     "Simple exit (no trailing stop)": {"use_trailing_stop": False},
+    "Add regime entry gate (rejected)": {"use_regime_filter": True},
+    "Add weekly filter (rejected)": {"use_weekly_filter": True},
 }
 
 def ablation_study(data, start, end, ablations = ABLATIONS, base_params = None, warmup_bars = 252):
@@ -1136,10 +1146,10 @@ def ablation_study(data, start, end, ablations = ABLATIONS, base_params = None, 
     table.loc["sharpe_change"] = table.loc["sharpe"] - table.loc["sharpe", "Full strategy"]
     return table
 
-def regime_history(data):
+def regime_history(data, adx_threshold = DEFAULT_PARAMS["adx_threshold"]):
     #for chart shading only. regime params aren't in the grid, but window warm-ups mean a backtest's
     #ADX can differ very slightly from this single full-history pass
-    detector = RegimeDetector()
+    detector = RegimeDetector(strength_threshold = adx_threshold)
     return pd.Series({bar["date"]: detector.update(bar)["regime"] for bar in data.stream()})
 
 #light chart surface and ink, plus the first three slots of a colorblind-validated categorical palette
@@ -1184,7 +1194,7 @@ def plot_backtest(data, results, title, path = None, start = None, end = None):
     equity = results["equity_curve"]["equity"].loc[start:end]
     dates = equity.index
     closes = data.get_close_series().loc[dates]
-    regimes = regime_history(data).reindex(dates)
+    regimes = regime_history(data, results["params"]["adx_threshold"]).reindex(dates)
     benchmark = buy_and_hold_equity(closes, equity.iloc[0]) #indexed to the strategy's equity on day one
 
     trades = results["trades"]
@@ -1241,15 +1251,13 @@ def plot_backtest(data, results, title, path = None, start = None, end = None):
     return fig
 
 
-#testing
+REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
+#starts in 2002 so that, after a year of warm-up and three of training, 2006 onwards (incl. 2008-09) is out of sample
+DATA_START = "2002-01-01"
+DATA_END = "2026-01-01"
 
-if __name__ == "__main__":
-    import time
-
-    ticker = "AAPL"
-    #starts in 2002 so that, after a year of warm-up and three of training, 2006 onwards (incl. 2008-09) is out of sample
-    stock = DataHandler(ticker, "2002-01-01", "2026-01-01")
-    report_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
+def single_ticker_report(ticker, start = DATA_START, end = DATA_END, report_dir = REPORT_DIR):
+    stock = DataHandler(ticker, start, end)
     os.makedirs(report_dir, exist_ok=True)
 
     started = time.perf_counter()
@@ -1278,7 +1286,7 @@ if __name__ == "__main__":
     ablation = ablation_study(stock, oos_start, oos_end)
     ablation_rows = ["cagr", "volatility", "sharpe", "sharpe_change", "sortino", "max_drawdown", "calmar",
                      "trades", "win_rate", "profit_factor", "time_in_market"]
-    print("\nAblation, default params, each row switches one component off:")
+    print("\nAblation, default params, each row switches one component off (or adds back the rejected weekly filter):")
     print(format_report(ablation.loc[ablation_rows]).T.to_string())
 
     report.to_csv(os.path.join(report_dir, f"{ticker}_performance.csv"))
@@ -1291,4 +1299,286 @@ if __name__ == "__main__":
     plot_backtest(stock, wf, f"{ticker} trade detail, 2019 to 2020 (out-of-sample)",
                   path=os.path.join(report_dir, f"{ticker}_detail_2019_2020.png"), start="2019-01-01", end="2020-12-31")
     print(f"\nCharts and tables saved to {report_dir}")
-    plt.show()
+
+#a deliberate mix: index ETFs, today's mega-cap winners, and stocks that were large caps in 2002 but had mixed or bad
+#runs since (GE, INTC, C...), so a good result can't just come from picking stocks we already know went up
+UNIVERSE = {
+    "Index ETF": ["SPY", "QQQ", "IWM"],
+    "Mega-cap winner": ["AAPL", "MSFT", "AMZN", "NVDA", "GOOGL"],
+    "2002 large cap": ["GE", "INTC", "XOM", "JNJ", "KO", "PFE", "IBM", "C", "WMT", "JPM"],
+}
+
+#ablation variant -> (component, sign). removing a helpful component lowers sharpe (sign -1),
+#adding a helpful one raises it (sign +1), so sign x sharpe_change is always "how much the component helps"
+ABLATION_COMPONENTS = {
+    "Fixed stop width (no regime)": ("Regime stop width", -1),
+    "No ensemble (Donchian only)": ("Ensemble", -1),
+    "No crash filter": ("Crash filter", -1),
+    "Simple exit (no trailing stop)": ("Trailing stop", -1),
+    "Add regime entry gate (rejected)": ("Regime entry gate", 1),
+    "Add weekly filter (rejected)": ("Weekly filter", 1),
+}
+
+def evaluate_ticker(ticker, start = DATA_START, end = DATA_END, base_params = None):
+    #top level so the worker processes in run_universe can call it
+    data = DataHandler(ticker, start, end)
+    wf = walk_forward(data, base_params = base_params, verbose = False)
+    oos_start, oos_end = wf["equity_curve"].index[0], wf["equity_curve"].index[-1]
+
+    report = performance_report(data, {"Strategy": wf})
+    ablation = ablation_study(data, oos_start, oos_end, base_params = base_params)
+
+    return {
+        "ticker": ticker,
+        "oos_start": oos_start,
+        "oos_end": oos_end,
+        "strategy": report["Strategy"].to_dict(),
+        "buy_hold": report["Buy & Hold"].to_dict(),
+        "mean_train_sharpe": wf["windows"]["train_sharpe"].mean(),
+        "mean_test_sharpe": wf["windows"]["test_sharpe"].mean(),
+        "ablation_sharpe_change": ablation.loc["sharpe_change"].drop("Full strategy").to_dict(),
+    }
+
+def run_universe(universe = UNIVERSE, start = DATA_START, end = DATA_END, max_workers = None, variants = None):
+    #variants maps a name to param overrides; every (variant, ticker) pair is its own walk-forward
+    variants = variants or {"Default": {}}
+    tickers = [ticker for group in universe.values() for ticker in group]
+
+    #download one at a time first, so the worker processes only ever read the cache
+    for ticker in tickers:
+        download_prices(ticker, start, end)
+
+    #each walk-forward is independent, so they run in parallel (one is ~1.5 minutes on one core)
+    jobs = [(name, ticker) for name in variants for ticker in tickers]
+    max_workers = max_workers or max(1, min(len(jobs), (os.cpu_count() or 2) - 2))
+    results = {name: {} for name in variants}
+    with ProcessPoolExecutor(max_workers = max_workers) as pool:
+        futures = {pool.submit(evaluate_ticker, ticker, start, end, variants[name]): (name, ticker)
+                   for name, ticker in jobs}
+        for done, future in enumerate(as_completed(futures), 1):
+            name, ticker = futures[future]
+            results[name][ticker] = future.result()
+            print(f"[{done}/{len(jobs)}] {name}: {ticker} done", flush=True)
+
+    return {name: [results[name][ticker] for ticker in tickers] for name in variants}
+
+def universe_table(results, universe = UNIVERSE):
+    group_of = {ticker: group for group, tickers in universe.items() for ticker in tickers}
+    rows = []
+    for result in results:
+        strategy, buy_hold = result["strategy"], result["buy_hold"]
+        rows.append({
+            "ticker": result["ticker"],
+            "group": group_of[result["ticker"]],
+            "oos_from": result["oos_start"].year,
+            "sharpe": strategy["sharpe"],
+            "bh_sharpe": buy_hold["sharpe"],
+            "sharpe_diff": strategy["sharpe"] - buy_hold["sharpe"],
+            "cagr": strategy["cagr"],
+            "bh_cagr": buy_hold["cagr"],
+            "max_drawdown": strategy["max_drawdown"],
+            "bh_max_drawdown": buy_hold["max_drawdown"],
+            "calmar": strategy["calmar"],
+            "bh_calmar": buy_hold["calmar"],
+            "trades": strategy["trades"],
+            "win_rate": strategy["win_rate"],
+            "profit_factor": strategy["profit_factor"],
+            "time_in_market": strategy["time_in_market"],
+            "train_sharpe": result["mean_train_sharpe"],
+            "test_sharpe": result["mean_test_sharpe"],
+        })
+    return pd.DataFrame(rows).set_index("ticker")
+
+def format_universe_table(table):
+    percent_columns = {"cagr", "bh_cagr", "max_drawdown", "bh_max_drawdown", "win_rate", "time_in_market"}
+    formatted = table.copy()
+    for column in formatted.columns:
+        if column in percent_columns:
+            formatted[column] = formatted[column].map(lambda value: f"{value * 100:.1f}%")
+        elif column == "sharpe_diff":
+            formatted[column] = formatted[column].map(lambda value: f"{value:+.2f}")
+        elif column in ("trades", "oos_from"):
+            formatted[column] = formatted[column].astype(int)
+        elif column != "group":
+            formatted[column] = formatted[column].map(lambda value: f"{value:.2f}")
+    return formatted
+
+def universe_headline(table):
+    count = len(table)
+    lines = [
+        f"Sharpe beat buy & hold on {(table['sharpe_diff'] > 0).sum()} of {count} "
+        f"(median {table['sharpe'].median():.2f} vs {table['bh_sharpe'].median():.2f})",
+        f"Calmar beat buy & hold on {(table['calmar'] > table['bh_calmar']).sum()} of {count} "
+        f"(median {table['calmar'].median():.2f} vs {table['bh_calmar'].median():.2f})",
+        f"Max drawdown smaller on {(table['max_drawdown'] > table['bh_max_drawdown']).sum()} of {count} "
+        f"(median {table['max_drawdown'].median():.1%} vs {table['bh_max_drawdown'].median():.1%})",
+        f"Train to test decay: median per-window Sharpe {table['train_sharpe'].median():.2f} in training, "
+        f"{table['test_sharpe'].median():.2f} out of sample",
+    ]
+    for group, members in table.groupby("group", sort=False):
+        lines.append(f"  {group}: beat buy & hold Sharpe on {(members['sharpe_diff'] > 0).sum()} of {len(members)}, "
+                     f"median Sharpe {members['sharpe'].median():.2f} vs {members['bh_sharpe'].median():.2f}")
+    return lines
+
+def universe_ablation(results):
+    #contribution = sharpe with the component minus sharpe without it, so positive means it helps
+    changes = pd.DataFrame({result["ticker"]: result["ablation_sharpe_change"] for result in results}).T
+    contributions = pd.DataFrame({component: sign * changes[variant]
+                                  for variant, (component, sign) in ABLATION_COMPONENTS.items()})
+    summary = pd.DataFrame({
+        "median": contributions.median(),
+        "mean": contributions.mean(),
+        "helps_on": (contributions > 0).sum(),
+        "out_of": len(contributions),
+    })
+    return contributions, summary
+
+def plot_universe(table, path = None):
+    ordered = table.sort_values("sharpe_diff")
+    positions = list(range(len(ordered)))
+
+    with plt.rc_context({"font.family": ["Segoe UI", "DejaVu Sans"]}):
+        fig, (ax_sharpe, ax_drawdown) = plt.subplots(1, 2, figsize=(12, 0.38 * len(ordered) + 1.8), sharey=True)
+        fig.patch.set_facecolor(CHART_COLORS["surface"])
+
+        for ax, strategy_column, benchmark_column, title in [
+                (ax_sharpe, "sharpe", "bh_sharpe", "Sharpe ratio"),
+                (ax_drawdown, "max_drawdown", "bh_max_drawdown", "Max drawdown")]:
+            ax.hlines(positions, ordered[strategy_column], ordered[benchmark_column],
+                      color=CHART_COLORS["axis"], linewidth=2, zorder=1)
+            ax.scatter(ordered[benchmark_column], positions, s=60, zorder=2, color=CHART_COLORS["muted"],
+                       edgecolors=CHART_COLORS["surface"], linewidths=1.5, label="Buy & hold")
+            ax.scatter(ordered[strategy_column], positions, s=60, zorder=3, color=CHART_COLORS["strategy"],
+                       edgecolors=CHART_COLORS["surface"], linewidths=1.5, label="Strategy")
+            ax.set_title(title, loc="left", fontsize=11, color=CHART_COLORS["ink"])
+            _style_axis(ax)
+
+        ax_sharpe.axvline(0, color=CHART_COLORS["axis"], linewidth=0.8)
+        ax_sharpe.set_yticks(positions)
+        ax_sharpe.set_yticklabels(ordered.index, color=CHART_COLORS["ink_secondary"])
+        ax_drawdown.xaxis.set_major_formatter(mticker.PercentFormatter(1.0, decimals=0))
+        ax_sharpe.legend(loc="lower left", bbox_to_anchor=(0, 1.06), ncol=2, frameon=False, fontsize=9,
+                         labelcolor=CHART_COLORS["ink_secondary"])
+
+        fig.suptitle("Walk-forward out-of-sample results by ticker, sorted by Sharpe vs buy & hold",
+                     x=0.01, ha="left", fontsize=13, color=CHART_COLORS["ink"])
+        fig.tight_layout()
+        if path is not None:
+            fig.savefig(path, dpi=150, facecolor=CHART_COLORS["surface"])
+    return fig
+
+def universe_report(universe = UNIVERSE, report_dir = REPORT_DIR):
+    os.makedirs(report_dir, exist_ok=True)
+    started = time.perf_counter()
+    results = run_universe(universe)["Default"]
+    print(f"Universe finished in {time.perf_counter() - started:.0f}s\n")
+
+    table = universe_table(results, universe)
+    print(format_universe_table(table).to_string())
+    print()
+    for line in universe_headline(table):
+        print(line)
+
+    contributions, summary = universe_ablation(results)
+    print("\nAblation, Sharpe contribution of each component (with it minus without it, default params, positive = helps):")
+    print(contributions.round(2).to_string())
+    print(summary.round(2).to_string())
+
+    table.to_csv(os.path.join(report_dir, "universe_results.csv"))
+    contributions.to_csv(os.path.join(report_dir, "universe_ablation.csv"))
+    plot_universe(table, path=os.path.join(report_dir, "universe_sharpe_drawdown.png"))
+    print(f"\nCharts and tables saved to {report_dir}")
+
+#experiments: each variant goes through the same walk-forward grid on the same universe, and the first one is the
+#baseline the others are compared against. params are spelled out so the results don't depend on DEFAULT_PARAMS
+#experiment 1: three ways of using the regime ("Stop width only" won and became the default)
+REGIME_VARIANTS = {
+    "Gate ADX 25": {"use_regime_filter": True, "adx_threshold": 25}, #entries only in trending regimes
+    "Stop width only": {"use_regime_filter": False, "adx_threshold": 25}, #entries in any regime
+    "Gate ADX 20": {"use_regime_filter": True, "adx_threshold": 20}, #same gate, "trending" switches on earlier
+}
+
+#experiment 2: does the regime's volatility half earn its place in the stop, or would one fixed k do as well?
+#the fixed k is the midpoint of each grid pair (2, 2.75, 4), so both variants have the same average stop width
+STOP_WIDTH_VARIANTS = {
+    "Regime stop width": {"use_regime_filter": False, "regime_stop_width": True},
+    "Fixed stop width": {"use_regime_filter": False, "regime_stop_width": False},
+}
+
+def variant_comparison(variant_results, universe = UNIVERSE):
+    tables = {name: universe_table(results, universe) for name, results in variant_results.items()}
+    baseline = next(iter(tables))
+
+    sharpe = pd.DataFrame({name: table["sharpe"] for name, table in tables.items()})
+    best = sharpe.idxmax(axis=1)
+    sharpe["Buy & hold"] = tables[baseline]["bh_sharpe"]
+    sharpe["best_variant"] = best
+
+    summary = pd.DataFrame({name: {
+        "median_sharpe": table["sharpe"].median(),
+        "mean_sharpe": table["sharpe"].mean(),
+        "median_diff_vs_baseline": (table["sharpe"] - tables[baseline]["sharpe"]).median(),
+        "beats_baseline_on": (table["sharpe"] > tables[baseline]["sharpe"]).sum() if name != baseline else np.nan,
+        "best_variant_on": (best == name).sum(),
+        "beats_buy_hold_on": (table["sharpe_diff"] > 0).sum(),
+        "median_calmar": table["calmar"].median(),
+        "median_cagr": table["cagr"].median(),
+        "median_max_drawdown": table["max_drawdown"].median(),
+        "median_trades": table["trades"].median(),
+        "median_time_in_market": table["time_in_market"].median(),
+        "median_train_sharpe": table["train_sharpe"].median(),
+        "median_test_sharpe": table["test_sharpe"].median(),
+    } for name, table in tables.items()})
+
+    return sharpe, summary
+
+def format_variant_summary(summary, ticker_count):
+    percent_rows = {"median_cagr", "median_max_drawdown", "median_time_in_market"}
+    count_rows = {"beats_baseline_on", "best_variant_on", "beats_buy_hold_on"}
+
+    def fmt(row, value):
+        if pd.isna(value):
+            return "-"
+        if row in percent_rows:
+            return f"{value * 100:.1f}%"
+        if row in count_rows:
+            return f"{int(value)} of {ticker_count}"
+        if row == "median_diff_vs_baseline":
+            return f"{value:+.2f}"
+        return f"{value:.2f}"
+
+    return pd.DataFrame({column: [fmt(row, summary.at[row, column]) for row in summary.index]
+                         for column in summary.columns}, index=summary.index)
+
+def variant_report(variants = REGIME_VARIANTS, universe = UNIVERSE, report_dir = REPORT_DIR, label = "regime"):
+    os.makedirs(report_dir, exist_ok=True)
+    started = time.perf_counter()
+    variant_results = run_universe(universe, variants = variants)
+    print(f"Variants finished in {time.perf_counter() - started:.0f}s\n")
+
+    sharpe, summary = variant_comparison(variant_results, universe)
+    print("Out-of-sample Sharpe by ticker:")
+    print(sharpe.round(2).to_string())
+    print()
+    print(format_variant_summary(summary, len(sharpe)).to_string())
+
+    sharpe.to_csv(os.path.join(report_dir, f"{label}_variants_sharpe.csv"))
+    summary.to_csv(os.path.join(report_dir, f"{label}_variants_summary.csv"))
+    print(f"\nTables saved to {report_dir}")
+
+
+if __name__ == "__main__":
+    #python Component.design.py                   -> full report for AAPL
+    #python Component.design.py SPY               -> full report for another ticker
+    #python Component.design.py --universe        -> walk-forward + ablation across the whole UNIVERSE
+    #python Component.design.py --compare-regime  -> the REGIME_VARIANTS through the walk-forward on the UNIVERSE
+    #python Component.design.py --compare-stop    -> the STOP_WIDTH_VARIANTS through the walk-forward on the UNIVERSE
+    if len(sys.argv) > 1 and sys.argv[1] == "--universe":
+        universe_report()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--compare-regime":
+        variant_report(REGIME_VARIANTS, label = "regime")
+    elif len(sys.argv) > 1 and sys.argv[1] == "--compare-stop":
+        variant_report(STOP_WIDTH_VARIANTS, label = "stop_width")
+    else:
+        single_ticker_report(sys.argv[1] if len(sys.argv) > 1 else "AAPL")
+        plt.show()

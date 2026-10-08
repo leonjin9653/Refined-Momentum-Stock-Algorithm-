@@ -12,6 +12,14 @@ This strategy's core thesis is that momentum's edge can be meaningfully improved
 
 The strategy is explicitly *not* optimized to maximize backtested return. It is optimized to maximize **risk-adjusted, out-of-sample robustness** — the property that actually matters when a strategy meets real, unseen data.
 
+**What out-of-sample testing found.** Each idea was tested on 18 tickers (index ETFs, mega-caps, and 2002-era large caps), with walk-forward parameter selection and 2006–2025 out of sample:
+
+1. **Trend-regime gating did not hold up.** Gating entries on an ADX trending regime lowered Sharpe on 13 of 18 tickers and was removed (§2). The regime now only sets stop width, which tested as a tie against a single fixed stop width (§6).
+2. **Volatility-scaled sizing is kept**, since it fixes the risk taken per trade by construction, but it was not tested against an alternative sizing rule. At 1% risk per trade on a single stock, the strategy only ever has part of its capital invested.
+3. **The four-signal ensemble did not beat a plain Donchian breakout** at default parameters (median −0.05 Sharpe; better on 7 of 18 tickers).
+
+Overall, the strategy's median out-of-sample Sharpe is 0.37 against 0.60 for buy-and-hold, and it beat buy-and-hold on 1 of 18 tickers. Its drawdowns are far smaller (median −10.4% vs −58.8%), but mostly because it is in the market about half the time with partial positions, not because of better timing.
+
 ---
 
 ## 2. Market Regime Framework
@@ -26,6 +34,18 @@ Before any momentum logic runs, the market is classified along two independent a
 These combine into four regimes: `trending_low_vol`, `trending_high_vol`, `ranging_low_vol`, `ranging_high_vol`.
 
 **Trend is the strategy switch** — momentum only trades in the two `trending_*` regimes. **Volatility is a risk-tuning knob** — it doesn't change *whether* the strategy trades, only *how large and how tightly-stopped* each position is.
+
+**Outcome: the trend switch was tested and rejected; the regime is now a risk setting only.** Three ways of using the regime were put through the same walk-forward on 18 tickers (2006–2025 out of sample):
+
+| Variant | Median OOS Sharpe | Better than the trend gate on |
+|---|---|---|
+| Trend gate at ADX 25 (as specified above) | 0.33 | — |
+| No gate: enter in any regime, regime sets stop width only | 0.37 | 13 of 18 (median +0.11) |
+| Trend gate at ADX 20 | 0.33 | 9 of 18 (median −0.01) |
+
+The gate mostly reduced time in the market (36% vs 54%) rather than picking better moments to be in it: removing it helped most on strong risers (AAPL, AMZN, GOOGL, GE) and hurt on weaker stocks (INTC, XOM, JNJ, PFE), where being out more often was the advantage. Removing it also deepened the median max drawdown (−7.2% → −10.4%), so Calmar did not improve. A likely cause is that ADX lags: by the time it crosses 25, much of the move has happened.
+
+The volatility axis is kept, but only weakly supported: setting the stop width by volatility regime versus one fixed width (the midpoint) was a tie — the fixed width was better on 11 of 18 tickers by a median of +0.01 Sharpe, with median Sharpe 0.31 vs 0.37 and mean 0.40 vs 0.37 (see §6).
 
 ---
 
@@ -54,6 +74,8 @@ Rather than a single indicator, entries require agreement across four independen
 **Why it's in the ensemble:** the regime filter already requires ADX > 25 to trade at all; this signal adds a finer-grained confirmation that trend strength is still developing rather than plateauing or rolling over.
 
 **Ensemble decision rule:** sum the four votes. Enter long only if score ≥ 3 (i.e. at least 3 of 4 agree) *and* the regime is `trending_*`. This dual-gate (regime + ensemble) is deliberately conservative — it will miss some moves, but the goal is signal quality, not signal quantity.
+
+*Update:* the regime half of this dual gate was dropped after testing (see §2), so entries now depend on the ensemble score alone. The ADX slope vote (§3.4) is unaffected; it still checks that ADX is rising, it just no longer sits on top of an ADX > 25 gate.
 
 ---
 
@@ -96,6 +118,15 @@ Position size is not a separate dial: because §4 sizes by `k × ATR_n`, a tight
 
 This isn't two strategies — it's one strategy with regime-aware dials, which is the practical distinction to be clear about in interviews: the *logic* doesn't change, only the *risk parameters*.
 
+**Outcome:** with the trend gate removed (§2), this table now applies in every regime: `k` follows the volatility half of the regime only (`*_low_vol` → tighter, `*_high_vol` → wider). It was tested against a single fixed `k` set to the midpoint of each pair (2, 2.75, 4 instead of 1.5/2.5, 2/3.5, 3/5), so both have the same average stop width:
+
+| Variant | Median OOS Sharpe | Mean OOS Sharpe | Median max drawdown |
+|---|---|---|---|
+| Regime-based `k` | 0.37 | 0.37 | −10.4% |
+| Fixed `k` | 0.31 | 0.40 | −8.7% |
+
+The fixed `k` was better on 11 of 18 tickers but by a median of only +0.01 Sharpe; it did better on the index ETFs and growth names (SPY +0.23, AAPL +0.24) and worse on the defensive stocks (WMT, JPM, IBM, JNJ). This is a tie: regime-based stop width neither clearly helps nor clearly hurts. It is kept as the default because it is the thesis as specified, but a fixed `k` is the simpler choice with no measurable loss.
+
 ---
 
 ## 7. Multi-Timeframe Confirmation
@@ -103,6 +134,8 @@ This isn't two strategies — it's one strategy with regime-aware dials, which i
 **Definition:** resample price data to weekly bars, run the same trend classification (ADX-based) on the weekly series, and require the weekly trend to also read `trending` before acting on a daily-level entry signal.
 
 **Why this matters:** a daily-level breakout inside a weekly ranging market is far more likely to be noise than a genuine trend. This is a standard technique for reducing whipsaw — trading in the direction of the higher timeframe while timing entries on the lower one.
+
+**Outcome: tested and rejected.** Implemented as specified (weekly bars built only from completed weeks, weekly ADX ≥ 25 with +DI > −DI). In the ablation study across 18 tickers (index ETFs, mega-caps and 2002-era large caps, 2006–2025 out of sample), adding the filter lowered Sharpe on 15 of 18 tickers (median −0.25): it vetoed too many entries without improving the ones it kept enough to compensate. It is disabled by default and removed from the walk-forward grid; the code remains so the result can be reproduced.
 
 ---
 
@@ -150,6 +183,8 @@ All of the above should be reported from the **walk-forward out-of-sample result
 Signal generation (ensemble voting) → regime filtering (trend as switch, volatility as risk dial) → risk-scaled sizing (volatility targeting) → adaptive exits (ATR trailing stop) → structural confirmation (multi-timeframe) → tail-risk awareness (crash filter) → honest validation (walk-forward) → risk-adjusted reporting.
 
 That chain — signal quality, regime awareness, risk-scaled execution, and rigorous out-of-sample validation — is the actual substance of a systematic quant strategy, and is what this project should communicate.
+
+**What held up after testing.** The validation half of the chain (next-open fills, transaction costs, walk-forward selection, buy-and-hold benchmark, ablation across 18 tickers) is what the project demonstrates most strongly — it is what caught the components that did not work. Of the strategy components, the trend gate (§2) and the weekly filter (§7) were rejected. The ensemble, regime-based stop width, crash filter and trailing stop each measured close to zero contribution (median between −0.06 and 0.00 Sharpe across the 18 tickers at default parameters, each helping on 6 to 9 of them). Median training-window Sharpe of 0.84 fell to 0.33 out of sample, which is the overfitting gap the walk-forward exists to expose.
 
 ---
 
